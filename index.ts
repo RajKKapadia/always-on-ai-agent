@@ -84,11 +84,8 @@ try {
   process.exit(1);
 }
 
-const memory = createMemory(
-  env.QDRANT_URL?.trim() || "http://127.0.0.1:6333",
-  apiKey,
-  store,
-);
+const qdrantUrl = env.QDRANT_URL?.trim() ?? "http://127.0.0.1:6333";
+const memory = qdrantUrl ? createMemory(qdrantUrl, apiKey, store) : undefined;
 const getWeather = createWeatherClient(weatherKey);
 const work = createEventWorker({
   store,
@@ -110,10 +107,10 @@ const server = startServer(
 console.log(`Agent listening at ${server.url} (${model}, ${timeZone})`);
 
 const shutdown = new AbortController();
-const workers = [
-  runWorker("Inbox", work, shutdown.signal),
-  runWorker("Memory index", memory.indexOne, shutdown.signal),
-];
+const workers = [runWorker("Inbox", work, shutdown.signal)];
+if (memory) {
+  workers.push(runWorker("Memory index", memory.indexOne, shutdown.signal));
+}
 if (telegramToken) {
   const telegram = createTelegramClient(telegramToken);
   workers.push(

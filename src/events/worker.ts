@@ -32,7 +32,7 @@ const failed = {
 
 export function createEventWorker(config: {
   store: EventStore;
-  memory: Memory;
+  memory?: Memory;
   model: AgentModel;
   getWeather: ReturnType<typeof createWeatherClient>;
   timeZone: string;
@@ -158,7 +158,7 @@ export function createEventWorker(config: {
         store.recentTurns(chatId),
         store.personalMemories(chatId),
       ]);
-      const related = await memory.related(message, chatId, recent, signal);
+      const related = (await memory?.related(message, chatId, recent, signal)) ?? [];
       context = { recent, related, personal };
       tools.push(scheduleWeatherTool(timeZone, stageAction));
       if (/^(?:please\s+)?remember\s+(?:that|my|this)\b/i.test(message)) {

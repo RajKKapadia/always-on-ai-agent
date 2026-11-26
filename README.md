@@ -23,14 +23,48 @@ flowchart LR
 
 ## Run locally
 
+Set `OPENAI_API_KEY` and `OPENWEATHER_API_KEY` in `.env`. For Telegram, create a bot with [BotFather](https://t.me/BotFather), set `TELEGRAM_BOT_TOKEN`, and start a private chat with it. Only one Bun process should poll a given bot token. If the bot was already set up to receive Telegram webhooks, use a separate bot token or disable its existing webhook before running the poller. To restrict your bot to specific private chats, set `TELEGRAM_ALLOWED_CHAT_IDS` to a comma-separated list of numeric chat IDs.
+
+### Without Docker on Linux Mint or Ubuntu
+
+Install and start PostgreSQL on the host. Create a dedicated role and database. The `createuser` command prompts for the database password.
+
+```bash
+sudo apt update
+sudo apt install postgresql
+sudo systemctl start postgresql
+sudo -u postgres createuser --pwprompt always_on_agent
+sudo -u postgres createdb --owner=always_on_agent always_on_agent
+```
+
+Keep your existing `.env` and update these two settings. If you are setting up a new checkout, first copy `.env.example` to `.env`. Use the password you chose above and percent-encode any reserved characters in the password.
+
+```dotenv
+DATABASE_URL=postgres://always_on_agent:YOUR_PASSWORD@127.0.0.1:5432/always_on_agent
+QDRANT_URL=
+```
+
+A blank `QDRANT_URL` disables semantic search. Schedules, approvals, saved preferences, and recent Telegram conversation history still use PostgreSQL. Set `QDRANT_URL` to a running Qdrant server if you want semantic search.
+
+From the repository root, install dependencies and start Bun in the foreground. The app creates its tables on startup.
+
+```bash
+bun install
+bun run start
+```
+
+In another terminal, check `curl -fsS http://127.0.0.1:3000/health`. Keep the Bun process and PostgreSQL running for on-time delivery. Use Ctrl+C to stop the app. Overdue schedules in that database are processed after startup.
+
+A fresh native database starts empty. Existing Docker schedules, approvals, and chat history stay in the Compose PostgreSQL volume until you migrate them.
+
+### With Docker dependencies
+
 ```bash
 bun install
 cp .env.example .env
 docker compose up -d --wait
 bun run start
 ```
-
-Before starting Bun, fill in `OPENAI_API_KEY` and `OPENWEATHER_API_KEY` in `.env`. For Telegram, create a bot with [BotFather](https://t.me/BotFather), set `TELEGRAM_BOT_TOKEN`, and start a private chat with it. Only one Bun process should poll a given bot token. If the bot was already set up to receive Telegram webhooks, use a separate bot token or disable its existing webhook before running the poller. To restrict your bot to specific private chats, set `TELEGRAM_ALLOWED_CHAT_IDS` to a comma-separated list of numeric chat IDs.
 
 | Setting                    | Default or purpose                                    |
 | -------------------------- | ----------------------------------------------------- |
@@ -57,7 +91,7 @@ docker compose --profile agent up -d --wait
 
 You can also say “Remember that my preferred name is Sam.” Use the same label to update a saved preference. The bot loads the latest 20 preferences from PostgreSQL for that chat. Qdrant continues to retrieve similar past conversations within the same chat. When you supply a city or another preference in a request, it takes priority for that request.
 
-Approval requests expire after 15 minutes. A scheduling request also expires when its proposed time arrives. Deny closes the request, and each approval applies to one action. Times without an explicit timezone use `AGENT_TIMEZONE`.
+Approval requests expire after 15 minutes. A scheduling request also expires when its proposed time arrives. Tapping Approve or Deny removes both buttons from that message, and each approval applies to one action. Times without an explicit timezone use `AGENT_TIMEZONE`.
 
 Local HTTP chat is also available for testing the agent and weather tool.
 

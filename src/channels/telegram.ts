@@ -12,7 +12,7 @@ interface Update {
   callback_query?: {
     id: string;
     from: { id: number };
-    message?: { chat: TelegramChat };
+    message?: { chat: TelegramChat; message_id: number };
     data?: string;
   };
 }
@@ -21,6 +21,7 @@ export class TelegramError extends Error {
   constructor(
     readonly status: number,
     readonly retryAfter?: number,
+    readonly description?: string,
   ) {
     super(`Telegram returned HTTP ${status}.`);
   }
@@ -54,12 +55,14 @@ export function createTelegramClient(
       ok: boolean;
       result: T;
       error_code?: number;
+      description?: string;
       parameters?: { retry_after?: number };
     };
     if (!response.ok || !body.ok) {
       throw new TelegramError(
         body.error_code ?? response.status,
         body.parameters?.retry_after,
+        body.description,
       );
     }
     return body.result;
@@ -77,6 +80,21 @@ export function createTelegramClient(
       await call(
         "answerCallbackQuery",
         { callback_query_id: id },
+        AbortSignal.any([signal, AbortSignal.timeout(4_000)]),
+      );
+    },
+    async clearApprovalButtons(
+      chatId: number,
+      messageId: number,
+      signal: AbortSignal,
+    ) {
+      await call(
+        "editMessageReplyMarkup",
+        {
+          chat_id: chatId,
+          message_id: messageId,
+          reply_markup: { inline_keyboard: [] },
+        },
         AbortSignal.any([signal, AbortSignal.timeout(4_000)]),
       );
     },
@@ -119,7 +137,7 @@ export type TelegramClient = ReturnType<typeof createTelegramClient>;
 
 export async function pollTelegram(
   telegram: TelegramClient,
-  store: EventStore,
+  store: Pick<EventStore, "enqueue">,
   allowed: ReadonlySet<string>,
   signal: AbortSignal,
 ) {
@@ -133,22 +151,39 @@ export async function pollTelegram(
         const message = update.message?.text?.trim();
         const chatId = String(update.message?.chat.id);
         if (callback) {
-          const chat = callback.message?.chat;
+          const prompt = callback.message;
           const decision = parseApprovalDecision(callback.data ?? "");
-          if (
-            chat?.type === "private" &&
-            chat.id === callback.from.id &&
-            allows(String(chat.id)) &&
-            decision
-          ) {
+          const approval =
+            prompt?.chat.type === "private" &&
+            prompt.chat.id === callback.from.id &&
+            allows(String(prompt.chat.id)) &&
+            decision;
+          if (approval) {
             await store.enqueue(`telegram:${update.update_id}`, {
               kind: "approval_decision",
-              chatId: String(chat.id),
-              ...decision,
+              chatId: String(prompt.chat.id),
+              ...approval,
             });
           }
-          // The decision is durable before clearing the Telegram loading indicator.
           await telegram.answerCallback(callback.id, signal).catch(() => {});
+          if (approval) {
+            // Keep the update unconfirmed if the edit needs to be retried.
+            await telegram
+              .clearApprovalButtons(prompt.chat.id, prompt.message_id, signal)
+              .catch((error: unknown) => {
+                if (!(error instanceof TelegramError) || error.retryable)
+                  throw error;
+                if (
+                  error.status === 400 &&
+                  error.description?.includes("message is not modified")
+                )
+                  return;
+                console.warn(
+                  "Could not clear Telegram approval buttons:",
+                  error.message,
+                );
+              });
+          }
         } else if (
           update.message?.chat.type === "private" &&
           message &&
