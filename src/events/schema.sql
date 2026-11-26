@@ -13,6 +13,20 @@ CREATE TABLE IF NOT EXISTS inbox (
 CREATE INDEX IF NOT EXISTS inbox_pending_idx
   ON inbox (available_at, created_at) WHERE finished_at IS NULL;
 
+ALTER TABLE inbox ADD COLUMN IF NOT EXISTS schedule_revision integer NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS inbox_editable_schedule_idx
+  ON inbox ((event->>'chatId'), available_at, id)
+  WHERE finished_at IS NULL AND attempts = 0
+    AND event->>'kind' IN ('scheduled_weather', 'scheduled_reminder');
+
+CREATE TABLE IF NOT EXISTS telegram_model_usage (
+  event_id uuid PRIMARY KEY REFERENCES inbox(id) ON DELETE CASCADE,
+  chat_id text NOT NULL,
+  used_on date NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telegram_model_usage_day_idx
+  ON telegram_model_usage (used_on, chat_id);
+
 CREATE TABLE IF NOT EXISTS telegram_outbox (
   id uuid PRIMARY KEY REFERENCES inbox(id),
   chat_id text NOT NULL,

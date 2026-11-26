@@ -9,6 +9,7 @@ import {
 } from "./src/events/worker.ts";
 import { createQueuedChat, startServer } from "./src/http.ts";
 import { createOpenAIModel } from "./src/models/openai.ts";
+import { isTimeZone } from "./src/tools/schedule.ts";
 import { createWeatherClient } from "./src/tools/weather.ts";
 
 const env = Bun.env;
@@ -28,10 +29,21 @@ if (!Number.isInteger(port) || port < 1 || port > 65_535) {
 }
 
 const timeZone = env.AGENT_TIMEZONE?.trim() || "Asia/Kolkata";
-try {
-  new Intl.DateTimeFormat("en-GB", { timeZone });
-} catch {
+if (!isTimeZone(timeZone)) {
   console.error("AGENT_TIMEZONE must be a valid IANA timezone.");
+  process.exit(1);
+}
+
+const telegramLimits = {
+  perChat: Number(env.TELEGRAM_CHAT_DAILY_AI_LIMIT ?? "30"),
+  total: Number(env.TELEGRAM_DAILY_AI_LIMIT ?? "1000"),
+};
+if (
+  Object.values(telegramLimits).some(
+    (limit) => !Number.isSafeInteger(limit) || limit < 1,
+  )
+) {
+  console.error("Telegram daily AI limits must be positive integers.");
   process.exit(1);
 }
 
@@ -93,6 +105,7 @@ const work = createEventWorker({
   model: createOpenAIModel({ apiKey, model }),
   getWeather,
   timeZone,
+  telegramLimits,
 });
 const webhook =
   webhookSecret && webhookChatId
@@ -114,6 +127,10 @@ if (memory) {
 if (telegramToken) {
   const telegram = createTelegramClient(telegramToken);
   workers.push(
+    telegram.setCommands(shutdown.signal).catch((error: unknown) => {
+      if (!shutdown.signal.aborted)
+        console.warn("Could not register the Telegram command menu:", error);
+    }),
     pollTelegram(telegram, store, allowedChatIds, shutdown.signal),
     runWorker(
       "Telegram outbox",

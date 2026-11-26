@@ -1,6 +1,67 @@
 import { expect, test } from "bun:test";
 import { createTelegramClient, pollTelegram } from "./telegram.ts";
 
+test("the public command menu and poller accept two private chats", async () => {
+  const shutdown = new AbortController();
+  const accepted: unknown[] = [];
+  const telegram = createTelegramClient("test", async (url, init) => {
+    const body = JSON.parse(String(init.body));
+    if (url.endsWith("/setMyCommands")) {
+      expect(body.scope).toEqual({ type: "all_private_chats" });
+      expect(
+        body.commands.map(({ command }: { command: string }) => command),
+      ).toEqual(
+        expect.arrayContaining([
+          "start",
+          "help",
+          "schedules",
+          "edit_schedule",
+          "delete_schedule",
+        ]),
+      );
+      return Response.json({ ok: true, result: true });
+    }
+    expect(url.endsWith("/getUpdates")).toBe(true);
+    if (body.offset) {
+      shutdown.abort();
+      return Response.json({ ok: true, result: [] });
+    }
+    return Response.json({
+      ok: true,
+      result: [
+        {
+          update_id: 1,
+          message: { chat: { id: 123, type: "private" }, text: "/start" },
+        },
+        {
+          update_id: 2,
+          message: { chat: { id: 456, type: "private" }, text: "/schedules" },
+        },
+        {
+          update_id: 3,
+          message: { chat: { id: -789, type: "group" }, text: "/start" },
+        },
+      ],
+    });
+  });
+  await telegram.setCommands(shutdown.signal);
+  await pollTelegram(
+    telegram,
+    {
+      async enqueue(key, event) {
+        accepted.push([key, event]);
+        return key;
+      },
+    },
+    new Set(),
+    shutdown.signal,
+  );
+  expect(accepted).toEqual([
+    ["telegram:1", { kind: "chat", chatId: "123", message: "/start" }],
+    ["telegram:2", { kind: "chat", chatId: "456", message: "/schedules" }],
+  ]);
+});
+
 test.each(["approve", "deny"] as const)(
   "tapping %s records the decision and clears both buttons from that prompt",
   async (decision) => {

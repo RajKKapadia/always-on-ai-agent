@@ -3,18 +3,29 @@ import { approvalLifetimeMinutes } from "../policies/approval.ts";
 import type {
   ApprovalDecision,
   ProtectedAction,
+  ScheduleReference,
 } from "../policies/approval.ts";
 import type { PersonalMemory } from "../tools/personal-memory.ts";
 import type { Place } from "../tools/weather.ts";
 
-export type Event =
-  | { kind: "chat"; chatId: string | null; message: string }
+export type ScheduledEvent =
   | {
       kind: "scheduled_weather";
       chatId: string;
       place: Place;
       approvalId?: string;
+      timeZone?: string;
     }
+  | {
+      kind: "scheduled_reminder";
+      chatId: string;
+      text: string;
+      timeZone: string;
+    };
+
+export type Event =
+  | { kind: "chat"; chatId: string | null; message: string }
+  | ScheduledEvent
   | ({ kind: "approval_decision"; chatId: string } & ApprovalDecision)
   | {
       kind: "webhook";
@@ -24,18 +35,30 @@ export type Event =
       data: unknown;
     };
 
-export interface WeatherSchedule {
-  event: Extract<Event, { kind: "scheduled_weather" }>;
-  at: string;
-  timeZone: string;
+export interface PendingSchedule {
+  id: string;
+  event: ScheduledEvent;
+  at: Date;
+  time_zone: string | null;
+  revision: number;
 }
+
+interface SaveSchedule {
+  operation: "save";
+  event: ScheduledEvent;
+  at: string;
+  replace?: ScheduleReference;
+}
+
+export const schedulesPageSize = 8;
 
 export interface EventCompletion {
   reply: string;
   failed?: boolean;
   proposal?: ProtectedAction;
-  schedule?: WeatherSchedule;
+  schedule?: SaveSchedule | { operation: "delete"; id: string };
   memory?: PersonalMemory;
+  forget?: { key?: string };
   turnMessage?: string;
 }
 
@@ -102,40 +125,65 @@ export function createEventStore(db: SQL) {
     },
     async finishEvent(job: InboxJob, completion: EventCompletion) {
       const {
-        reply,
+        reply: plannedReply,
         failed = false,
         proposal,
         schedule,
         memory,
+        forget,
         turnMessage,
       } = completion;
       await db.begin(async (tx) => {
-        const [finished] = await tx`
-          UPDATE inbox SET finished_at = now(), lease_until = NULL, reply = ${reply}, failed = ${failed}
-          WHERE id = ${job.id} AND attempts = ${job.attempts} AND finished_at IS NULL RETURNING id
+        const [claimed] = await tx`
+          SELECT id FROM inbox WHERE id = ${job.id} AND attempts = ${job.attempts}
+            AND finished_at IS NULL FOR UPDATE
         `;
-        if (!finished) return;
+        if (!claimed) return;
+        let reply = plannedReply;
         if (proposal) {
           const deadline =
-            proposal.kind === "schedule_weather" ? proposal.at : null;
+            proposal.kind === "schedule_weather" ||
+            proposal.kind === "schedule_reminder"
+              ? proposal.at
+              : null;
           await tx`
             INSERT INTO action_approvals (id, chat_id, action, expires_at)
             VALUES (${job.id}, ${job.event.chatId}, ${tx.json(proposal)},
               LEAST(now() + ${approvalLifetimeMinutes} * interval '1 minute', ${deadline}::timestamptz))
           `;
         }
-        if (schedule) {
-          await tx`
-            INSERT INTO inbox (event_key, event, available_at)
-            VALUES (${`schedule:${job.id}`}, ${tx.json(schedule.event)}, ${schedule.at}::timestamptz)
-          `;
-        }
         if (job.event.chatId !== null) {
-          await tx`
-            INSERT INTO telegram_outbox (id, chat_id, message, approval_id)
-            VALUES (${job.id}, ${job.event.chatId}, ${reply}, ${proposal ? job.id : null})
-          `;
-          if (turnMessage && !failed) {
+          const chatId = job.event.chatId;
+          if (schedule?.operation === "delete") {
+            const [removed] = await tx`
+              UPDATE inbox SET finished_at = now() WHERE id = ${schedule.id}::uuid
+                AND event->>'chatId' = ${chatId} AND event->>'kind' IN ('scheduled_weather', 'scheduled_reminder')
+                AND finished_at IS NULL AND attempts = 0 RETURNING id
+            `;
+            if (!removed)
+              reply =
+                "That schedule is no longer available. Use /schedules to refresh the list.";
+          }
+          if (schedule?.operation === "save") {
+            if (schedule.replace) {
+              const [updated] = await tx`
+                UPDATE inbox SET event = ${tx.json(schedule.event)}, available_at = ${schedule.at}::timestamptz,
+                  schedule_revision = schedule_revision + 1
+                WHERE id = ${schedule.replace.id}::uuid AND schedule_revision = ${schedule.replace.revision}
+                  AND event->>'chatId' = ${chatId} AND event->>'kind' IN ('scheduled_weather', 'scheduled_reminder')
+                  AND finished_at IS NULL AND attempts = 0 RETURNING id
+              `;
+              if (!updated)
+                reply =
+                  "That schedule changed or started delivering. Use /schedules and try again.";
+            } else {
+              await tx`
+                INSERT INTO inbox (event_key, event, available_at)
+                VALUES (${`schedule:${job.id}`}, ${tx.json(schedule.event)}, ${schedule.at}::timestamptz)
+              `;
+            }
+          }
+          if (turnMessage && !failed && reply === plannedReply) {
             await tx`
               INSERT INTO conversation_turns (id, chat_id, message, reply)
               VALUES (${job.id}, ${job.event.chatId}, ${turnMessage}, ${reply})
@@ -148,7 +196,64 @@ export function createEventStore(db: SQL) {
               ON CONFLICT (chat_id, key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
             `;
           }
+          if (forget) {
+            const key = forget.key ?? null;
+            const removed = await tx`
+              DELETE FROM personal_memories WHERE chat_id = ${chatId}
+                AND (${key}::text IS NULL OR key = ${key})
+            `;
+            if (!removed.count) reply = "No matching saved preferences.";
+          }
+          await tx`
+            INSERT INTO telegram_outbox (id, chat_id, message, approval_id)
+            VALUES (${job.id}, ${chatId}, ${reply}, ${proposal ? job.id : null})
+          `;
         }
+        await tx`
+          UPDATE inbox SET finished_at = now(), lease_until = NULL, reply = ${reply}, failed = ${failed}
+          WHERE id = ${job.id}
+        `;
+      });
+    },
+    async pendingSchedules(chatId: string, page = 1, id?: string) {
+      const identifier = id ?? null;
+      return db<PendingSchedule[]>`
+        SELECT s.id, s.event, s.available_at AS at, s.schedule_revision AS revision,
+          COALESCE(s.event->>'timeZone', a.action->>'timeZone') AS time_zone
+        FROM inbox AS s LEFT JOIN action_approvals AS a
+          ON a.id = (s.event->>'approvalId')::uuid
+        WHERE s.event->>'chatId' = ${chatId} AND s.event->>'kind' IN ('scheduled_weather', 'scheduled_reminder')
+          AND s.finished_at IS NULL AND s.attempts = 0
+          AND (${identifier}::text IS NULL OR s.id::text = ${identifier} OR left(s.id::text, 8) = ${identifier})
+        ORDER BY s.available_at, s.id LIMIT ${id ? 2 : schedulesPageSize + 1}
+        OFFSET ${(page - 1) * schedulesPageSize}
+      `;
+    },
+    async reserveTelegramModelRequest(
+      eventId: string,
+      chatId: string,
+      chatLimit: number,
+      dailyLimit: number,
+    ) {
+      return db.begin(async (tx) => {
+        // Serialize quota reservations for the UTC day across workers.
+        await tx`SELECT pg_advisory_xact_lock(54109, (now() AT TIME ZONE 'UTC')::date - date '2000-01-01')`;
+        const [existing] = await tx`
+          SELECT event_id FROM telegram_model_usage WHERE event_id = ${eventId}
+        `;
+        if (existing) return "allowed";
+        const [usage] = await tx<{ total: number; chat: number }[]>`
+          SELECT count(*)::int AS total, (count(*) FILTER (WHERE chat_id = ${chatId}))::int AS chat
+          FROM telegram_model_usage WHERE used_on = (now() AT TIME ZONE 'UTC')::date
+        `;
+        if (!usage) throw new Error("Could not read Telegram usage.");
+        if (usage.chat >= chatLimit) return "chat_limit";
+        if (usage.total >= dailyLimit) return "daily_limit";
+        await tx`
+          INSERT INTO telegram_model_usage (event_id, chat_id, used_on)
+          VALUES (${eventId}, ${chatId}, (now() AT TIME ZONE 'UTC')::date)
+        `;
+        return "allowed";
       });
     },
     async decideApproval(
@@ -219,7 +324,7 @@ export function createEventStore(db: SQL) {
       const rows = await db<PersonalMemory[]>`
         SELECT key, value FROM personal_memories
         WHERE chat_id = ${chatId}
-        ORDER BY updated_at DESC, key LIMIT 20
+        ORDER BY (key = 'timezone') DESC, updated_at DESC, key LIMIT 20
       `;
       return [...rows];
     },

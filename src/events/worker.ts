@@ -1,28 +1,48 @@
 import { createAgent } from "../agent.ts";
-import type { AgentContext, AgentModel } from "../agent.ts";
+import type { AgentContext, AgentModel, AgentTool } from "../agent.ts";
 import { TelegramError } from "../channels/telegram.ts";
 import type { TelegramClient } from "../channels/telegram.ts";
+import {
+  telegramHelp,
+  telegramWelcome,
+} from "../channels/telegram-commands.ts";
 import {
   approvalPrompt,
   formatDeliveryTime,
   formatPlace,
   parseApprovalDecision,
+  scheduleDescription,
 } from "../policies/approval.ts";
 import type {
   ApprovalDecision,
   ProtectedAction,
+  ScheduledAction,
 } from "../policies/approval.ts";
 import {
   createRememberTool,
   parsePersonalMemory,
 } from "../tools/personal-memory.ts";
 import type { PersonalMemory } from "../tools/personal-memory.ts";
-import { scheduleWeatherTool } from "../tools/schedule.ts";
+import {
+  editScheduleTool,
+  isTimeZone,
+  scheduleReminderTool,
+  scheduleWeatherTool,
+} from "../tools/schedule.ts";
 import { createWeatherTool } from "../tools/weather.ts";
 import type { createWeatherClient, Place } from "../tools/weather.ts";
 import type { Memory } from "./memory.ts";
-import { deliveryAttemptLimit, eventAttemptLimit } from "./store.ts";
-import type { EventCompletion, EventStore, InboxJob } from "./store.ts";
+import {
+  deliveryAttemptLimit,
+  eventAttemptLimit,
+  schedulesPageSize,
+} from "./store.ts";
+import type {
+  EventCompletion,
+  EventStore,
+  InboxJob,
+  PendingSchedule,
+} from "./store.ts";
 import { invalidWeatherWebhook, webhookAction } from "./webhook.ts";
 
 const failed = {
@@ -30,14 +50,31 @@ const failed = {
   failed: true,
 };
 
+const scheduleIdPattern =
+  /^[\da-f]{8}(?:-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12})?$/i;
+
+function scheduleDetails(
+  row: PendingSchedule,
+  defaultZone: string,
+): ScheduledAction {
+  const timing = {
+    at: row.at.toISOString(),
+    timeZone: row.time_zone ?? defaultZone,
+  };
+  return row.event.kind === "scheduled_weather"
+    ? { ...timing, kind: "schedule_weather", place: row.event.place }
+    : { ...timing, kind: "schedule_reminder", text: row.event.text };
+}
+
 export function createEventWorker(config: {
   store: EventStore;
   memory?: Memory;
   model: AgentModel;
   getWeather: ReturnType<typeof createWeatherClient>;
   timeZone: string;
+  telegramLimits: { perChat: number; total: number };
 }) {
-  const { store, memory, model, getWeather, timeZone } = config;
+  const { store, memory, model, getWeather, timeZone, telegramLimits } = config;
 
   function propose(job: InboxJob, action: ProtectedAction): EventCompletion {
     return {
@@ -84,23 +121,33 @@ export function createEventWorker(config: {
             ? undefined
             : `Current weather for ${formatPlace(action.place)}`,
         };
-      case "schedule_weather": {
+      case "schedule_weather":
+      case "schedule_reminder": {
         const chatId = job.event.chatId;
         if (chatId === null)
-          return { reply: "Scheduled weather requires a Telegram chat." };
+          return { reply: "Scheduled deliveries require a Telegram chat." };
+        const timing = { chatId, timeZone: action.timeZone };
+        const description = scheduleDescription(action);
         return {
-          reply: `Scheduled. I’ll send current weather for ${formatPlace(action.place)} on ${formatDeliveryTime(action.at, action.timeZone)}.`,
+          reply: `${action.replace ? "Schedule updated." : "Scheduled."}\n${description}\n${formatDeliveryTime(action.at, action.timeZone)}\nUse /schedules to manage it.`,
           schedule: {
+            operation: "save",
             at: action.at,
-            timeZone: action.timeZone,
-            event: {
-              kind: "scheduled_weather",
-              chatId,
-              place: action.place,
-              approvalId: decision.approvalId,
-            },
+            replace: action.replace,
+            event:
+              action.kind === "schedule_weather"
+                ? {
+                    ...timing,
+                    kind: "scheduled_weather",
+                    place: action.place,
+                    approvalId: decision.approvalId,
+                  }
+                : { ...timing, kind: "scheduled_reminder", text: action.text },
           },
-          turnMessage: `Schedule weather for ${formatPlace(action.place)}`,
+          turnMessage:
+            action.kind === "schedule_weather"
+              ? `Schedule weather for ${formatPlace(action.place)}`
+              : undefined,
         };
       }
       case "relay_webhook":
@@ -108,6 +155,173 @@ export function createEventWorker(config: {
           reply: `Event: ${action.type} (${action.source})\n${JSON.stringify(action.data, null, 2)}`,
         };
     }
+  }
+
+  async function modelReply(
+    job: InboxJob,
+    chatId: string | null,
+    message: string,
+    signal: AbortSignal,
+    options?: { reminder: true } | { edit: PendingSchedule },
+  ): Promise<EventCompletion> {
+    if (chatId !== null) {
+      const usage = await store.reserveTelegramModelRequest(
+        job.id,
+        chatId,
+        telegramLimits.perChat,
+        telegramLimits.total,
+      );
+      if (usage === "chat_limit")
+        return {
+          reply:
+            "You’ve reached your daily limit for AI requests. It resets at midnight UTC. You can still list and cancel schedules.",
+        };
+      if (usage === "daily_limit")
+        return {
+          reply:
+            "The bot has reached its daily limit for AI requests. It resets at midnight UTC. You can still list and cancel schedules.",
+        };
+    }
+
+    let proposal: ProtectedAction | undefined;
+    let entry: PersonalMemory | undefined;
+    const stageAction = (action: ProtectedAction) => {
+      if (proposal || entry) return false;
+      proposal = action;
+      return true;
+    };
+    let tools: AgentTool[];
+    let context: AgentContext | undefined;
+    if (options && "edit" in options) {
+      const { edit } = options;
+      tools = [
+        editScheduleTool(
+          {
+            ...scheduleDetails(edit, timeZone),
+            id: edit.id,
+            revision: edit.revision,
+          },
+          stageAction,
+        ),
+      ];
+    } else {
+      tools = options
+        ? []
+        : [
+            createWeatherTool((place) =>
+              stageAction({ kind: "weather", place }),
+            ),
+          ];
+      if (chatId !== null) {
+        const [recent, personal] = await Promise.all([
+          options ? [] : store.recentTurns(chatId),
+          store.personalMemories(chatId),
+        ]);
+        const related = options
+          ? []
+          : ((await memory?.related(message, chatId, recent, signal)) ?? []);
+        context = { recent, related, personal };
+        const savedZone = personal.find(({ key }) => key === "timezone")?.value;
+        const zone = savedZone && isTimeZone(savedZone) ? savedZone : timeZone;
+        tools.push(scheduleReminderTool(zone, stageAction));
+        if (!options) tools.push(scheduleWeatherTool(zone, stageAction));
+        if (
+          !options &&
+          /^(?:please\s+)?remember\s+(?:that|my|this)\b/i.test(message)
+        ) {
+          tools.push(
+            createRememberTool((candidate) => {
+              if (proposal || entry) return false;
+              entry = candidate;
+              return true;
+            }),
+          );
+        }
+      }
+    }
+    const reply = await createAgent(model, tools)(message, signal, context);
+    if (proposal) return propose(job, proposal);
+    if (entry)
+      return { reply: `Saved ${entry.key}: ${entry.value}.`, memory: entry };
+    return { reply, turnMessage: options ? undefined : message };
+  }
+
+  async function handleScheduleCommand(
+    job: InboxJob,
+    chatId: string,
+    command: string,
+    args: string,
+    signal: AbortSignal,
+  ): Promise<EventCompletion> {
+    if (command === "schedules" || command === "list_schedules") {
+      if (args && !/^[1-9]\d{0,6}$/.test(args))
+        return {
+          reply: "Use /schedules or /schedules followed by a page number.",
+        };
+      const page = args ? Number(args) : 1;
+      const rows = await store.pendingSchedules(chatId, page);
+      if (rows.length === 0)
+        return {
+          reply:
+            page === 1
+              ? "You have no pending schedules."
+              : "There are no schedules on that page. Use /schedules to start again.",
+        };
+      const lines = rows.slice(0, schedulesPageSize).map((row) => {
+        const action = scheduleDetails(row, timeZone);
+        const description = scheduleDescription(action).replace(/\s+/g, " ");
+        const label =
+          description.length > 120
+            ? `${description.slice(0, 119)}…`
+            : description;
+        return `${label}\n${formatDeliveryTime(action.at, action.timeZone)}\nID ${row.id}`;
+      });
+      const next =
+        rows.length > schedulesPageSize
+          ? `\n\nNext page /schedules ${page + 1}`
+          : "";
+      return {
+        reply: `${lines.join("\n\n")}\n\nUse /edit_schedule ID followed by the change, or /delete_schedule ID. You can use the full ID or its first 8 characters.${next}`,
+      };
+    }
+
+    const [, id = "", change = ""] =
+      /^(\S+)(?:\s+([\s\S]+))?$/.exec(args) ?? [];
+    const edit = command === "edit_schedule";
+    if (!scheduleIdPattern.test(id) || edit !== Boolean(change)) {
+      return {
+        reply: edit
+          ? "Use /edit_schedule ID followed by what should change. For example, /edit_schedule a1b2c3d4 tomorrow at 7 pm. Find the ID with /schedules."
+          : "Use /delete_schedule ID. Find the ID with /schedules.",
+      };
+    }
+    const [schedule, other] = await store.pendingSchedules(
+      chatId,
+      1,
+      id.toLowerCase(),
+    );
+    if (other)
+      return {
+        reply:
+          "That short ID matches two or more schedules. Use the full ID from /schedules.",
+      };
+    if (!schedule)
+      return {
+        reply:
+          "That schedule is unavailable. Use /schedules to see your pending deliveries.",
+      };
+    if (edit)
+      return modelReply(
+        job,
+        chatId,
+        `Change this schedule: ${change}`,
+        signal,
+        { edit: schedule },
+      );
+    return {
+      reply: "Schedule canceled.",
+      schedule: { operation: "delete", id: schedule.id },
+    };
   }
 
   async function handleChat(
@@ -122,60 +336,94 @@ export function createEventWorker(config: {
     }
 
     const chatId = job.event.chatId;
-    if (chatId !== null && /^\/memories$/i.test(message)) {
-      const personal = await store.personalMemories(chatId);
-      return {
-        reply: personal.length
-          ? personal.map(({ key, value }) => `${key}: ${value}`).join("\n")
-          : "You have no saved preferences. Try /remember weather city = Mumbai, India.",
-      };
-    }
-
-    if (chatId !== null && /^\/remember\b/i.test(message)) {
-      const fields = /^\/remember\s+([^=]+)=(.+)$/i.exec(message);
-      const entry = parsePersonalMemory(fields?.[1], fields?.[2]);
-      return entry
-        ? { reply: `Saved ${entry.key}: ${entry.value}.`, memory: entry }
-        : {
+    const command = /^\/([a-z0-9_]+)(?:@[a-z0-9_]+)?(?:\s+([\s\S]*))?$/i.exec(
+      message,
+    );
+    if (chatId === null || !command)
+      return modelReply(job, chatId, message, signal);
+    const name = command[1]?.toLowerCase();
+    const args = command[2]?.trim() ?? "";
+    switch (name) {
+      case "start":
+        return { reply: telegramWelcome };
+      case "help":
+        return { reply: telegramHelp };
+      case "remind":
+        return args
+          ? modelReply(job, chatId, `Create a reminder: ${args}`, signal, {
+              reminder: true,
+            })
+          : { reply: "Try /remind call Dad tomorrow at 6 pm." };
+      case "schedules":
+      case "list_schedules":
+      case "edit_schedule":
+      case "delete_schedule":
+      case "cancel_schedule":
+        return handleScheduleCommand(job, chatId, name, args, signal);
+      case "timezone": {
+        if (!args) {
+          const personal = await store.personalMemories(chatId);
+          const saved = personal.find(({ key }) => key === "timezone")?.value;
+          return {
             reply:
-              "Use /remember label = value, for example /remember weather city = Mumbai, India.",
+              saved && isTimeZone(saved)
+                ? `Your scheduling timezone is ${saved}.`
+                : `Your scheduling timezone defaults to ${timeZone}. Set your own with /timezone Europe/London.`,
           };
-    }
-
-    let proposal: ProtectedAction | undefined;
-    let entry: PersonalMemory | undefined;
-    const stageAction = (action: ProtectedAction) => {
-      if (proposal || entry) return false;
-      proposal = action;
-      return true;
-    };
-    const tools = [
-      createWeatherTool((place) => stageAction({ kind: "weather", place })),
-    ];
-    let context: AgentContext | undefined;
-    if (chatId !== null) {
-      const [recent, personal] = await Promise.all([
-        store.recentTurns(chatId),
-        store.personalMemories(chatId),
-      ]);
-      const related = (await memory?.related(message, chatId, recent, signal)) ?? [];
-      context = { recent, related, personal };
-      tools.push(scheduleWeatherTool(timeZone, stageAction));
-      if (/^(?:please\s+)?remember\s+(?:that|my|this)\b/i.test(message)) {
-        tools.push(
-          createRememberTool((candidate) => {
-            if (proposal || entry) return false;
-            entry = candidate;
-            return true;
-          }),
-        );
+        }
+        return isTimeZone(args)
+          ? {
+              reply: `Timezone saved. New schedules will use ${args}.`,
+              memory: { key: "timezone", value: args },
+            }
+          : {
+              reply:
+                "Use an IANA timezone, for example /timezone Europe/London or /timezone Asia/Kolkata.",
+            };
       }
+      case "memories": {
+        const personal = await store.personalMemories(chatId);
+        return {
+          reply: personal.length
+            ? personal.map(({ key, value }) => `${key}: ${value}`).join("\n")
+            : "You have no saved preferences. Try /remember weather city = Mumbai, India.",
+        };
+      }
+      case "remember": {
+        const fields = /^([^=]+)=(.+)$/.exec(args);
+        const entry = parsePersonalMemory(fields?.[1], fields?.[2]);
+        return entry
+          ? { reply: `Saved ${entry.key}: ${entry.value}.`, memory: entry }
+          : {
+              reply:
+                "Use /remember label = value, for example /remember weather city = Mumbai, India.",
+            };
+      }
+      case "forget": {
+        const entry = parsePersonalMemory(args, "unused");
+        return entry
+          ? {
+              reply: `Removed saved preference “${entry.key}”.`,
+              forget: { key: entry.key },
+            }
+          : {
+              reply:
+                "Use /forget followed by a label, for example /forget weather city.",
+            };
+      }
+      case "clear_preferences":
+        return args
+          ? {
+              reply:
+                "Use /clear_preferences to remove all your saved preferences.",
+            }
+          : { reply: "Saved preferences cleared.", forget: {} };
+      default:
+        return {
+          reply:
+            "I don’t recognize that command. Send /help for the available commands.",
+        };
     }
-    const reply = await createAgent(model, tools)(message, signal, context);
-    if (proposal) return propose(job, proposal);
-    if (entry)
-      return { reply: `Saved ${entry.key}: ${entry.value}.`, memory: entry };
-    return { reply, turnMessage: message };
   }
 
   async function processEvent(
@@ -206,6 +454,8 @@ export function createEventWorker(config: {
           return { reply: "This scheduled update has no valid approval." };
         return { reply: await weatherReply(action.place, signal) };
       }
+      case "scheduled_reminder":
+        return { reply: `Reminder: ${event.text}` };
     }
   }
 

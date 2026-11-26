@@ -1,6 +1,6 @@
 # Always-on AI agent
 
-A Bun worker that accepts Telegram messages and authenticated webhook events. It answers questions and asks for approval before looking up current weather, scheduling a one-time weather update, or relaying a webhook payload.
+A Bun worker that accepts private Telegram messages and authenticated webhook events. It answers questions, remembers preferences per chat, and manages one-time reminders and weather updates. It asks for approval before creating or editing a delivery, looking up weather, or relaying a webhook payload.
 
 ```mermaid
 flowchart LR
@@ -72,7 +72,10 @@ bun run start
 | `DATABASE_URL`             | Matches the local PostgreSQL service in Compose       |
 | `QDRANT_URL`               | `http://127.0.0.1:6333`                               |
 | `PORT`                     | `3000` on localhost                                   |
-| `AGENT_TIMEZONE`           | `Asia/Kolkata` for times without an explicit timezone |
+| `AGENT_TIMEZONE`           | `Asia/Kolkata` until a user sets their own timezone   |
+| `TELEGRAM_ALLOWED_CHAT_IDS` | Blank for public access or a list of private chat IDs |
+| `TELEGRAM_CHAT_DAILY_AI_LIMIT` | `30` AI requests per private chat per UTC day   |
+| `TELEGRAM_DAILY_AI_LIMIT` | `1000` AI requests across all chats per UTC day      |
 | `WEBHOOK_SECRET`           | Shared bearer secret for incoming webhooks            |
 | `WEBHOOK_TELEGRAM_CHAT_ID` | Fixed Telegram destination for webhook notifications  |
 
@@ -82,16 +85,25 @@ To run the Bun worker under Docker's restart policy, use the `agent` profile in 
 docker compose --profile agent up -d --wait
 ```
 
-## Try it in Telegram
+## Public Telegram access
 
-1. Send `/remember weather city = Mumbai, India`.
-2. Ask “What’s the weather?” The bot includes the resolved city in the approval prompt. Tap **Approve** to allow the lookup.
-3. Ask “Send me the weather at 5 p.m.” The bot asks you to approve the city, date, time, and timezone. This one approval covers creating the timer, fetching weather when it’s due, and delivering it to the same chat.
-4. Send `/memories` to see your latest saved facts and preferences.
+Leave `TELEGRAM_ALLOWED_CHAT_IDS` blank, run the bot, and share its `t.me/<bot_username>` link. If the bot has restricted access in Telegram, set its access to public there as well. Each user opens their own private chat and taps **Start**. The worker registers the private-chat command menu on startup. [Telegram command scopes](https://core.telegram.org/bots/api#botcommandscopeallprivatechats)
 
-You can also say “Remember that my preferred name is Sam.” Use the same label to update a saved preference. The bot loads the latest 20 preferences from PostgreSQL for that chat. Qdrant continues to retrieve similar past conversations within the same chat. When you supply a city or another preference in a request, it takes priority for that request.
+| Command or message | What it does |
+| --- | --- |
+| `/start` or `/help` | Get examples or see how to use the bot |
+| `/timezone Europe/London` | Set your timezone for new schedules. Send `/timezone` to see the current setting |
+| `/remind call Dad tomorrow at 6 pm` | Propose a one-time reminder |
+| “Send me the weather in Mumbai tomorrow at 8 am” | Propose a one-time current weather update |
+| `/schedules` | List pending items and their IDs. Use `/schedules 2` for page 2 |
+| `/edit_schedule ID tomorrow at 7 pm` | Propose a new time. You can also change the reminder text or weather city |
+| `/delete_schedule ID` | Cancel a pending item. Use the full ID or its first eight characters |
+| `/remember weather city = Mumbai, India` | Save or update a preference |
+| `/memories`, `/forget weather city`, `/clear_preferences` | View or remove saved preferences. Conversation history is stored separately |
 
-Approval requests expire after 15 minutes. A scheduling request also expires when its proposed time arrives. Tapping Approve or Deny removes both buttons from that message, and each approval applies to one action. Times without an explicit timezone use `AGENT_TIMEZONE`.
+Tap **Approve** to create or edit a schedule. Approving a weather schedule authorizes the lookup at delivery time. Approval prompts show the exact time and timezone and expire after 15 minutes or at the proposed delivery time, whichever comes first. Edits keep the same ID and can only apply while the schedule is pending. Cancellation takes effect immediately for pending schedules.
+
+You can also ask questions or say “Remember that my preferred name is Sam.” Explicit details in a request take priority over saved preferences. If enabled, Qdrant retrieves related turns from the same chat. Daily AI limits count model-backed Telegram requests and reset at midnight UTC. Listing and canceling schedules and receiving an existing delivery work after a limit is reached.
 
 Local HTTP chat is also available for testing the agent and weather tool.
 
@@ -160,4 +172,4 @@ bun run typecheck
 bun test
 ```
 
-The tests use simulated API responses and run without credentials. Weather data comes from [OpenWeatherMap](https://openweathermap.org/api/current).
+The tests use simulated API responses and run without credentials. Set `TEST_DATABASE_URL` to a PostgreSQL test database to also run the schedule integration test in a temporary schema. Weather data comes from [OpenWeatherMap](https://openweathermap.org/api/current).

@@ -1,5 +1,6 @@
 import type { EventStore } from "../events/store.ts";
 import { parseApprovalDecision } from "../policies/approval.ts";
+import { telegramCommands } from "./telegram-commands.ts";
 
 interface TelegramChat {
   id: number;
@@ -69,6 +70,13 @@ export function createTelegramClient(
   }
 
   return {
+    async setCommands(signal: AbortSignal) {
+      await call(
+        "setMyCommands",
+        { commands: telegramCommands, scope: { type: "all_private_chats" } },
+        AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+      );
+    },
     getUpdates(offset: number | undefined, signal: AbortSignal) {
       return call<Update[]>(
         "getUpdates",
