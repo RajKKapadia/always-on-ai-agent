@@ -1,0 +1,62 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: agent
+      POSTGRES_DB: agent
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+  qdrant:
+    image: qdrant/qdrant:v1.15.5
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+  agent:
+    profiles: [agent]
+    image: oven/bun:1.4.5
+    restart: unless-stopped
+    working_dir: /app
+    command: [bun, index.ts]
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://agent:agent@postgres:5432/agent
+      QDRANT_URL: http://qdrant:6333
+      BIND_HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "127.0.0.1:${PORT:-3000}:3000"
+    volumes:
+      - ./index.ts:/app/index.ts:ro
+      - ./src:/app/src:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          CMD,
+          bun,
+          -e,
+          'if (!(await fetch("http://127.0.0.1:3000/health")).ok) process.exit(1)',
+        ]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+volumes:
+  postgres_data:
+  qdrant_data:
