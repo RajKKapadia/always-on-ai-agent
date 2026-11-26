@@ -70,10 +70,15 @@ export function createTelegramClient(
   }
 
   return {
-    async setCommands(signal: AbortSignal) {
+    async setCommandMenu(signal: AbortSignal) {
       await call(
         "setMyCommands",
         { commands: telegramCommands, scope: { type: "all_private_chats" } },
+        AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+      );
+      await call(
+        "setChatMenuButton",
+        { menu_button: { type: "commands" } },
         AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
       );
     },

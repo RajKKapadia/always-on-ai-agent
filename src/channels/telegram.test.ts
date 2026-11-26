@@ -1,24 +1,16 @@
 import { expect, test } from "bun:test";
+import { telegramCommands } from "./telegram-commands.ts";
 import { createTelegramClient, pollTelegram } from "./telegram.ts";
 
 test("the public command menu and poller accept two private chats", async () => {
   const shutdown = new AbortController();
   const accepted: unknown[] = [];
+  const menuCalls: unknown[] = [];
   const telegram = createTelegramClient("test", async (url, init) => {
+    const method = url.split("/").at(-1);
     const body = JSON.parse(String(init.body));
-    if (url.endsWith("/setMyCommands")) {
-      expect(body.scope).toEqual({ type: "all_private_chats" });
-      expect(
-        body.commands.map(({ command }: { command: string }) => command),
-      ).toEqual(
-        expect.arrayContaining([
-          "start",
-          "help",
-          "schedules",
-          "edit_schedule",
-          "delete_schedule",
-        ]),
-      );
+    if (method === "setMyCommands" || method === "setChatMenuButton") {
+      menuCalls.push([method, body]);
       return Response.json({ ok: true, result: true });
     }
     expect(url.endsWith("/getUpdates")).toBe(true);
@@ -44,7 +36,14 @@ test("the public command menu and poller accept two private chats", async () => 
       ],
     });
   });
-  await telegram.setCommands(shutdown.signal);
+  await telegram.setCommandMenu(shutdown.signal);
+  expect(menuCalls).toEqual([
+    [
+      "setMyCommands",
+      { commands: telegramCommands, scope: { type: "all_private_chats" } },
+    ],
+    ["setChatMenuButton", { menu_button: { type: "commands" } }],
+  ]);
   await pollTelegram(
     telegram,
     {

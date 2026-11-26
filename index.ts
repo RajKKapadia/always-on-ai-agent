@@ -127,10 +127,16 @@ if (memory) {
 if (telegramToken) {
   const telegram = createTelegramClient(telegramToken);
   workers.push(
-    telegram.setCommands(shutdown.signal).catch((error: unknown) => {
-      if (!shutdown.signal.aborted)
-        console.warn("Could not register the Telegram command menu:", error);
-    }),
+    telegram.setCommandMenu(shutdown.signal).then(
+      () => console.log("Telegram command menu registered."),
+      (error: unknown) => {
+        if (!shutdown.signal.aborted)
+          console.warn(
+            "Could not configure the Telegram command menu:",
+            error instanceof Error ? error.message : "Unknown error",
+          );
+      },
+    ),
     pollTelegram(telegram, store, allowedChatIds, shutdown.signal),
     runWorker(
       "Telegram outbox",
